@@ -15,9 +15,12 @@
 #include <Preferences.h>
 #include <TinyGPS++.h>
 #include "lora_common.h"
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
 
 #ifndef BEACON_INTERVAL_MS
-#define BEACON_INTERVAL_MS 5000
+#define BEACON_INTERVAL_MS 2000
 #endif
 #ifndef BEACON_JITTER_MS
 #define BEACON_JITTER_MS 400
@@ -28,6 +31,15 @@
 #ifndef BEACON_USE_GPS
 #define BEACON_USE_GPS 1
 #endif
+
+// Pinos I2C da T-Beam
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+Adafruit_MPU6050 mpu;
+
+// Limite de g's para considerar uma queda ou impacto brusco
+const float LIMITE_QUEDA = 8;  // testar e alterar isso
 
 static TinyGPSPlus gps;
 static Preferences prefs;
@@ -125,7 +137,26 @@ static void handleSerial() {
   }
 }
 
-static void handleButton() {
+static void handleButtonAcel() {
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // Converte a aceleração de m/s² para 'g'
+  float ax = a.acceleration.x / 9.81;
+  float ay = a.acceleration.y / 9.81;
+  float az = a.acceleration.z / 9.81;
+
+  // Calcula a aceleração resultante em 3D
+  float aceleracaoTotal = sqrt(ax * ax + ay * ay + az * az);
+
+  if (aceleracaoTotal > LIMITE_QUEDA) {
+    Serial.println("\n>>> [ALERTA]: Possível queda ou impacto detectado! <<<");
+    sosMode = 1;
+    
+    delay(2000); // Pausa para evitar múltiplos disparos no mesmo impacto
+  }
+
   static bool last = true;
   static uint32_t lastChange = 0;
   bool now = digitalRead(BUTTON_PIN);           // HIGH = solto
@@ -134,7 +165,7 @@ static void handleButton() {
     last = now;
     if (!now) {                                 // borda de descida: pressionado
       sosMode = !sosMode;
-      Serial.printf("# botao: sos = %d\n", sosMode);
+      //Serial.printf("# botao: sos = %d\n", sosMode);
       blink(sosMode ? 5 : 1, 80);
       nextTxMs = millis();                      // transmite já
     }
@@ -171,16 +202,35 @@ void setup() {
   blink(3, 100);
   // Atraso inicial aleatório: vários beacons ligados juntos não colidem sempre
   nextTxMs = millis() + (esp_random() % intervalMs);
+
+  // Inicializa o barramento I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  Serial.println("Inicializando MPU6050 na T-Beam...");
+
+  if (!mpu.begin()) {
+    Serial.println("Falha ao encontrar o MPU6050! Verifique as conexões.");
+    while (1) {
+      delay(10);
+    }
+  }
+  Serial.println("Sensor MPU6050 conectado com sucesso!");
+
+  // Configura a faixa do acelerômetro para 8g
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
 }
+
 
 void loop() {
 #if BEACON_USE_GPS
   while (Serial1.available()) gps.encode(Serial1.read());
 #endif
   handleSerial();
-  handleButton();
-
-  if ((int32_t)(millis() - nextTxMs) >= 0) {
+  handleButtonAcel();
+// mudança aqui
+  if ((int32_t)(millis() - nextTxMs) >= 0 && sosMode) {
     sendBeacon();
     scheduleNext();
   }
