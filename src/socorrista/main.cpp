@@ -1,31 +1,24 @@
-
 // =====================================================================
-//  SOCORRISTA (unidade móvel) - TTGO T-Beam T22 V0.7
-//  - Recebe os pacotes dos beacons e mede RSSI / SNR / erro de frequência.
-//  - Marca cada recepção com a própria posição GPS -> "âncora virtual".
-//  - Agrupa amostras próximas (ANCHOR_RADIUS_M) em uma mesma âncora,
-//    fazendo a média do RSSI (reduz o desvanecimento rápido).
-//  - Estima a posição do beacon por multilateração (grade + LM)
-//    e informa distância e rumo do socorrista até o alvo.
+//  SOCORRISTA - TTGO T-Beam T22 V0.7  (VERSÃO SEM GPS / PONTOS FIXOS)
 //
-//  Saída serial (115200) em CSV + linhas humanas iniciadas por '#':
-//   pacote recebido: PKT,ms,id,seq,rssi,snr,rssi_eff,freq_err,lat,lon,hdop,sats,ancora,flags,b_lat,b_lon
-//   est posicao: EST,ms,id,lat,lon,raio1s_m,n_ancoras,A,rms_db,geom,dist_m,rumo_deg,erro_real_m
+//  Fluxo:
+//   1. Vá até o ponto fixo N (coordenada conhecida, tabela PONTOS abaixo).
+//   2. Aperte o botão -> o ESP32 coleta CAPTURE_SAMPLES pacotes do beacon
+//      e grava a média do RSSI como a "âncora" do ponto N.
+//   3. Vá ao ponto seguinte e repita.
+//   4. Com MIN_ANCHORS pontos coletados, a multilateração estima o beacon
+//      (a cada novo ponto a estimativa é refeita).
 //
-//  Comandos (terminar com Enter):
-//    status | reset | n <valor> | a <dBm> | raio <m> | estimarA 0/1
-//    cal <dist_m>  -> as próximas 10 recepções entram na calibração com essa distância
-//    autocal 0/1   -> usa o GPS do beacon (se enviado) como distância real
-//    ajustar       -> ajusta A e n por mínimos quadrados com os pontos de calibração
-//    calreset      -> apaga os pontos de calibração
+//  Comandos serial (Enter): status | reset | ponto <n> | n <v> | a <dBm> | estimarA 0/1
+//   "ponto 3" -> volta para o ponto 3 (recoletar / pular).
 // =====================================================================
 #include <Arduino.h>
-#include <Preferences.h> //gravação de pares chave/valor na flash
-#include <TinyGPS++.h> // classe TinyGPSPlus
-#include "lora_common.h" // arquivo com as structs 
+#include <Preferences.h>
+#include <TinyGPS++.h>      // só para distanceBetween / courseTo (funções estáticas)
+#include "lora_common.h"
 #include "multilateration.h"
 
-// UART para a Pico (matriz de LEDs)
+// ---- UART para a Pico (matriz de LEDs) ----
 #ifndef PICO_TX_PIN
 #define PICO_TX_PIN 13
 #endif
@@ -34,259 +27,221 @@
 #endif
 #define PICO_BAUD 115200
 
-#ifndef MODEL_A_DBM
-#define MODEL_A_DBM -45.0 // rssi esperado a 1m (calibrar)
+// ---- botão ----
+// T-Beam V0.7: botão do usuário em GPIO39
+#ifndef BUTTON_PIN
+#define BUTTON_PIN 39
 #endif
-#ifndef MODEL_N //expoente de perda de percurso
+
+#ifndef MODEL_A_DBM
+#define MODEL_A_DBM -45.0
+#endif
+#ifndef MODEL_N
 #define MODEL_N 2.7
 #endif
-#ifndef ANCHOR_RADIUS_M
-#define ANCHOR_RADIUS_M 8.0 //agrupar amostras de raio 8m numa mesma âncora
-#endif
 
-// ---- parâmetros de qualidade ----
-// HDOP : diluicao horizontal de precisao, quanto menor, melhor
-static const float    MAX_HDOP          = 5.0f;   // GPS do socorrista precisa estar bom
-static const uint32_t MAX_FIX_AGE_MS    = 2000;  // ms que posicao do gps foi lida
-static const int      MIN_SATS          = 4;
-static const float    SIGMA_SHADOW_DB   = 4.0f;   // sombreamento (desvio padrao dos obstaculos)
-static const float    SIGMA_FADING_DB   = 4.0f;   // desvanecimento rápido (cai com 1/N)(multipercurso)
-static const int      MIN_ANCHORS       = 7;      //aumento do dobro de âncoras
-static const int      MAX_ANCHORS       = 40;
-static const int      MAX_BEACONS       = 4;
-static const int      CAL_SAMPLES       = 10; //pacotes coletados por ponto de calibração manual
-static const uint32_t STATUS_PERIOD_MS  = 15000; // intervalo relatorio status
+// ---- PONTOS FIXOS CONHECIDOS ----
+struct Ponto { double lat, lon; };
+static const Ponto PONTOS[] = {
+  { -8.0564630, -34.9507170 },  // ponto 1
+  { -8.0568564, -34.9506161 },  // ponto 2
+  { -8.0568544, -34.9504444 },  // ponto 3
+  { -8.0569616, -34.9503978 },  // ponto 4
+  { -8.0568591, -34.9501497 },  // ponto 5
+};
+static const int N_PONTOS = sizeof(PONTOS) / sizeof(PONTOS[0]);
+
+// ---- parâmetros ---- n
+
+static const float    SIGMA_SHADOW_DB  = 4.0f;
+static const float    SIGMA_FADING_DB  = 4.0f;
+static const int      MIN_ANCHORS      = 4;      // 3 incógnitas (x, y, A) -> mínimo 4 pontos
+static const int      MAX_BEACONS      = 4;
+static const int      CAPTURE_SAMPLES  = 10;     // pacotes por ponto
+static const uint32_t CAPTURE_TIMEOUT_MS = 30000;
+static const uint32_t DEBOUNCE_MS      = 50;
+static const uint32_t STATUS_PERIOD_MS = 15000;
 
 // ---- estado ----
-static TinyGPSPlus gps; // objeto que guarda posição, HDOP e satélites
 static Preferences prefs;
-// modelo de perca de propagacao, define a e n da formula rssi pra metros
 static loc::PathLossModel model = { (float)MODEL_A_DBM, (float)MODEL_N };
-static loc::SolverOptions solverOpt; // padroes tipo min sat e etc
-static float anchorRadius = ANCHOR_RADIUS_M;
+static loc::SolverOptions solverOpt;
 
-// Origem do plano local (primeira posição GPS válida do socorrista)
-static bool   originSet = false; //já escolhemos a origem?
-static double lat0 = 0, lon0 = 0, cosLat0 = 1;
-static const double EARTH_R = 6371000.0; // raio medio da terra
+// Plano local: origem = ponto 1. px/py = posição de cada ponto em metros.
+static double lat0, lon0, cosLat0;
+static double px[N_PONTOS], py[N_PONTOS];
+static const double EARTH_R = 6371000.0;
 
 struct VirtualAnchor {
-  double  x, y;          // posição média (m)
-  float   meanRssi;      // rssi medio amostras (média de Welford)
-  float   m2; //soma dos quadrados dos desvios (nao usa?)
-  uint16_t count; // amostras
-  uint32_t lastMs; // tempo da ultima atualização
+  double   x, y;
+  float    meanRssi;
+  float    m2;
+  uint16_t count;       // 0 = ponto ainda não coletado para este beacon
+  uint32_t lastMs;
 };
 
-struct BeaconTrack { // ficha do beacon
+struct BeaconTrack {
   bool     used;
   uint32_t id;
-  uint32_t lastSeq; // ult num de seq visto
-  uint32_t received; // pacotes recebidos
-  uint32_t lost; // pacotes perdidos estimados
-  uint32_t lastSeenMs; // quando foi visto pela ultima vez
-  uint8_t  lastFlags; // ultimos sos, gps
+  uint32_t lastSeq;
+  uint32_t received;
+  uint32_t lost;
+  uint32_t lastSeenMs;
+  uint8_t  lastFlags;
   uint16_t batteryMv;
   bool     hasTruth;
-  double   truthLat, truthLon; // gps do proprio beacon para verif
-  VirtualAnchor anchors[MAX_ANCHORS]; // vet das ancoras
-  int      nAnchors; // anc em uso
-  loc::Estimate est; // ultima estimativa
+  double   truthLat, truthLon;
+  VirtualAnchor anchors[N_PONTOS];   // uma âncora por ponto fixo (índice = ponto)
+  loc::Estimate est;
 };
-static BeaconTrack tracks[MAX_BEACONS]; // 4 beacons (cada um ocupa 1kb)
+static BeaconTrack tracks[MAX_BEACONS];
 
-// Calibração: regressão linear  rssi = A + n * x,  x = -10 log10(d)
-struct CalSums { double n, sx, sy, sxx, sxy; } cal = {0, 0, 0, 0, 0};
-static int   calRemaining = 0; //pacotes ainda faltam coletar na calibração manual
-static float calDistance  = 0; // distância real informada no comando cal
-static bool  autoCal      = false;
+// ---- estado da coleta ----
+static int      curPoint     = 0;     // próximo ponto a coletar
+static bool     capturing    = false;
+static int      capRemaining = 0;
+static uint32_t capStartMs   = 0;
+static int      lastDonePoint = -1;   // último ponto concluído (referência p/ rumo)
 
 // ---------------------------------------------------------------------
-// converte lat e lon em metros
 static void toLocal(double lat, double lon, double& x, double& y) {
   x = (lon - lon0) * DEG_TO_RAD * EARTH_R * cosLat0;
   y = (lat - lat0) * DEG_TO_RAD * EARTH_R;
 }
-// converte metros para lat e long
 static void toGeo(double x, double y, double& lat, double& lon) {
   lat = lat0 + (y / EARTH_R) * RAD_TO_DEG;
   lon = lon0 + (x / (EARTH_R * cosLat0)) * RAD_TO_DEG;
 }
 
-// gps.location.isValid() = 1 se o gps fixou
-static bool gpsGood() {
-  return gps.location.isValid() && gps.location.age() < MAX_FIX_AGE_MS &&
-         gps.hdop.isValid() && gps.hdop.hdop() <= MAX_HDOP &&
-         (int)gps.satellites.value() >= MIN_SATS;
-}
-
 static const char* compass(double deg) {
   static const char* p[] = {"N", "NE", "L", "SE", "S", "SO", "O", "NO"};
-  return p[(int)((deg + 22.5) / 45.0) & 7]; // ex: (22,5+22,5) / 45 = 1 & 111 = 1 (NE)
-  // & 7 -> rest da div por 8 (faz a volta em 360°)
+  return p[(int)((deg + 22.5) / 45.0) & 7];
 }
 
-//acha ou cria a ficha do beacon
 static BeaconTrack* getTrack(uint32_t id) {
-  BeaconTrack* freeSlot = nullptr; // NULO
+  BeaconTrack* freeSlot = nullptr;
   for (auto& t : tracks) {
-    if (t.used && t.id == id) return &t; // achou e devolve o ponteiro
+    if (t.used && t.id == id) return &t;
     if (!t.used && !freeSlot) freeSlot = &t;
   }
-  if (!freeSlot) {          // substitui o mais antigo se nao tem espaco
+  if (!freeSlot) {
     freeSlot = &tracks[0];
     for (auto& t : tracks) if (t.lastSeenMs < freeSlot->lastSeenMs) freeSlot = &t;
   }
-  *freeSlot = BeaconTrack{}; // zera ficha
-  freeSlot->used = true; // preenche
+  *freeSlot = BeaconTrack{};
+  freeSlot->used = true;
   freeSlot->id = id;
- // Serial.printf("# novo beacon %08X\n", id);
-  return freeSlot; // devolve o ponteiro do novo beacon
+  return freeSlot;
 }
 
-// Adiciona uma medição à âncora virtual mais próxima (ou cria uma nova).
-static int addToAnchor(BeaconTrack& t, double x, double y, float rssi) {
-  int best = -1; double bestD = 1e18;
-  for (int i = 0; i < t.nAnchors; i++) {
-    double dx = t.anchors[i].x - x, dy = t.anchors[i].y - y;
-    double d = sqrt(dx * dx + dy * dy);
-    if (d < bestD) { bestD = d; best = i; }
-  }
-  VirtualAnchor* a;
-  if (best >= 0 && bestD <= anchorRadius) {
-    a = &t.anchors[best];
-  } else {
-    if (t.nAnchors < MAX_ANCHORS) {
-      best = t.nAnchors++;
-    } else {                               // cheio: recicla a âncora mais antiga
-      best = 0;
-      for (int i = 1; i < t.nAnchors; i++)
-        if (t.anchors[i].lastMs < t.anchors[best].lastMs) best = i;
-    }
-    a = &t.anchors[best];
-    memset(a, 0, sizeof(*a));
-  }
-  a->count++;
-  float delta = rssi - a->meanRssi;
-  a->meanRssi += delta / a->count;
-  a->m2 += delta * (rssi - a->meanRssi);
-  a->x += (x - a->x) / a->count;
-  a->y += (y - a->y) / a->count;
-  a->lastMs = millis();
-  return best; //devolve o índice da âncora
+// Soma uma medição na âncora do ponto fixo 'idx' (média de Welford).
+static void addToPoint(BeaconTrack& t, int idx, float rssi) {
+  VirtualAnchor& a = t.anchors[idx];
+  a.x = px[idx];
+  a.y = py[idx];
+  a.count++;
+  float delta = rssi - a.meanRssi;
+  a.meanRssi += delta / a.count;
+  a.m2 += delta * (rssi - a.meanRssi);
+  a.lastMs = millis();
 }
 
-// DISPARA MULTILATERACAO
-static void runEstimate(BeaconTrack& t) {
-  loc::Anchor buf[MAX_ANCHORS];
+static int countAnchors(const BeaconTrack& t) {
   int n = 0;
-  for (int i = 0; i < t.nAnchors; i++) {
+  for (int i = 0; i < N_PONTOS; i++) if (t.anchors[i].count > 0) n++;
+  return n;
+}
+
+// ---------------------------------------------------------------------
+static void runEstimate(BeaconTrack& t) {
+  loc::Anchor buf[N_PONTOS];
+  int n = 0;
+  for (int i = 0; i < N_PONTOS; i++) {
     const VirtualAnchor& v = t.anchors[i];
+    if (v.count == 0) continue;
     float var = SIGMA_SHADOW_DB * SIGMA_SHADOW_DB +
                 SIGMA_FADING_DB * SIGMA_FADING_DB / v.count;
     buf[n++] = { (float)v.x, (float)v.y, v.meanRssi, 1.0f / var };
   }
-  if (n < MIN_ANCHORS) { // sem anc suficiente
-    //Serial.printf("# [%08X] %d/%d ancoras - continue se deslocando\n", t.id, n, MIN_ANCHORS);
-    Serial.printf("%d de %d ancoras\n", n, MIN_ANCHORS);
-    Serial.printf("se mova\n");
+  if (n < MIN_ANCHORS) {
+    Serial.printf("%d de %d pontos\n", n, MIN_ANCHORS);
     return;
   }
 
-  uint32_t t0 = micros();
-  t.est = loc::multilaterate(buf, n, model, solverOpt); // chama solver
-  uint32_t dt = micros() - t0;
-  if (!t.est.valid) return; // nao valido, sai e nao estima
+  t.est = loc::multilaterate(buf, n, model, solverOpt);
+  if (!t.est.valid) return;
 
   double elat, elon;
-  toGeo(t.est.x, t.est.y, elat, elon); // converte as coord estimadas do beacon
+  toGeo(t.est.x, t.est.y, elat, elon);
 
-  double dist = -1, course = -1; // comeca nao disponivel
-  if (gps.location.isValid()) {
-    dist   = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), elat, elon); // dist beacon
-    course = TinyGPSPlus::courseTo(gps.location.lat(), gps.location.lng(), elat, elon); // rumo do beacon em graus
+  // Sem GPS: distância/rumo a partir do último ponto fixo em que você esteve.
+  double dist = -1, course = -1;
+  if (lastDonePoint >= 0) {
+    dist   = TinyGPSPlus::distanceBetween(PONTOS[lastDonePoint].lat, PONTOS[lastDonePoint].lon, elat, elon);
+    course = TinyGPSPlus::courseTo(PONTOS[lastDonePoint].lat, PONTOS[lastDonePoint].lon, elat, elon);
   }
   double trueErr = -1;
-  if (t.hasTruth) // se os gps do beacon foi enviado, 
+  if (t.hasTruth)
     trueErr = TinyGPSPlus::distanceBetween(t.truthLat, t.truthLon, elat, elon);
 
-  //Serial.printf("EST,%lu,%08X,%.7f,%.7f,%.1f,%d,%.1f,%.2f,%.2f,%.1f,%.0f,%.1f\n",
-  //              (unsigned long)millis(), t.id, elat, elon, t.est.radius1s, n,
-  //              t.est.A, t.est.rmsResidualDb, t.est.geometry, dist, course, trueErr);
-  //Serial.printf("[%08X] ALVO ~ %.6f, %.6f  (+/- %.0f m)  |  %.0f m rumo %.0f%s %s\n",
-  //              t.id, elat, elon, t.est.radius1s, dist, course, "\xC2\xB0", compass(course));
   Serial.printf("ALVO %.0f m\n", dist);
   Serial.printf("lat %.6f\n", elat);
   Serial.printf("lon %.6f\n",elon);
-  Serial.printf("rumo %.0f%\n", course);
-  Serial.printf("%s\n", compass(course));
 
-    // ---- envia para a Pico (matriz de LEDs) ----
-  if (dist >= 0 && course >= 0) {
-    Serial2.printf("%s\n", compass(course));
-  }
-                
-  //Serial.printf("#            ancoras=%d  A=%.1f%s  residuo=%.1f dB  geom=%.2f  (%lu ms)\n",
-  //              n, t.est.A, t.est.estimatedA ? "(est.)" : "", t.est.rmsResidualDb,
-  //              t.est.geometry, (unsigned long)(dt / 1000));
-  //if (trueErr >= 0) Serial.printf("#            erro real (GPS do beacon) = %.1f m\n", trueErr);
-  if (t.est.geometry < 0.3f)
-    //Serial.println("#            geometria ruim: desloque-se PERPENDICULAR ao trajeto atual");
-    Serial.println("ande PERPENDICULAR ao trajeto atual\n");
-}
+  //if (dist >= 0)
+  //  Serial.printf("  do ponto %d: %.0f m, rumo %.0f graus %s\n",
+  //                lastDonePoint + 1, dist, course, compass(course));
+ //Serial.printf("  pontos=%d A=%.1f residuo=%.1f dB geom=%.2f\n",n, t.est.A, t.est.rmsResidualDb, t.est.geometry);
+  //if (trueErr >= 0) Serial.printf("  erro real (GPS do beacon) = %.1f m\n", trueErr);
+  //if (t.est.geometry < 0.3f) Serial.println("  geometria ruim: pontos quase alinhados");
 
-static void addCalPoint(float rssi, double d) {
-  if (d < 2.0) return;
-  double x = -10.0 * log10(d);
-  cal.n += 1; cal.sx += x; cal.sy += rssi; cal.sxx += x * x; cal.sxy += x * rssi;
-}
-
-static void fitCalibration() {
-  double den = cal.n * cal.sxx - cal.sx * cal.sx;
-  if (cal.n < 5) { Serial.println("# calibracao: pontos insuficientes (min 5)"); return; }
-  if (den / (cal.n * cal.n) < 1.0) {
-    // pouca variação de distância: ajusta só A mantendo n
-    model.A = (cal.sy - model.n * cal.sx) / cal.n;
-    Serial.printf("# calibracao (so A, distancias pouco variadas): A=%.1f n=%.2f\n", model.A, model.n);
-  } else {
-    double nn = (cal.n * cal.sxy - cal.sx * cal.sy) / den;
-    double A  = (cal.sy - nn * cal.sx) / cal.n;
-    if (nn < 1.5 || nn > 6.0) {
-      Serial.printf("# calibracao rejeitada: n=%.2f fora de [1.5, 6]\n", nn);
-      return;
-    }
-    model.A = A; model.n = nn;
-    Serial.printf("# calibracao: A=%.1f dBm  n=%.2f  (%d pontos)\n", model.A, model.n, (int)cal.n);
-  }
-  prefs.putFloat("A", model.A); //grava calibração na flash
-  prefs.putFloat("n", model.n);
+  if (dist >= 0 && course >= 0) Serial2.printf("%s\n", compass(course));
 }
 
 // ---------------------------------------------------------------------
-// DIO0 (RxDone) só levanta a flag; o pacote é lido fora da interrupção.
 static volatile bool rxFlag = false;
 static void IRAM_ATTR onRxDone() { rxFlag = true; }
+
+static void finishCapture(bool ok) {
+  capturing = false;
+  if (!ok) {
+    //Serial.printf("ponto %d: nenhum pacote recebido (timeout). Aperte o botao de novo.\n", curPoint + 1);
+    return;
+  }
+  Serial.printf("p%d coletado\n", curPoint + 1);
+  lastDonePoint = curPoint;
+  for (auto& t : tracks) if (t.used && t.anchors[curPoint].count > 0) runEstimate(t);
+  if (curPoint < N_PONTOS - 1) {
+    curPoint++;
+    Serial.printf("va ate ponto %d\n", curPoint + 1);
+  } else {
+    //Serial.println("# todos os pontos coletados (use 'ponto <n>' para recoletar)");
+  }
+}
+
+static void startCapture() {
+  if (capturing) return;
+  // recoleta: zera a âncora desse ponto em todos os beacons
+  for (auto& t : tracks) if (t.used) memset(&t.anchors[curPoint], 0, sizeof(VirtualAnchor));
+  capturing    = true;
+  capRemaining = CAPTURE_SAMPLES;
+  capStartMs   = millis();
+  //Serial.printf("# coletando no ponto %d (%.6f, %.6f)... fique parado\n", curPoint + 1, PONTOS[curPoint].lat, PONTOS[curPoint].lon);
+}
 
 static void handlePacket() {
   uint8_t buf[256];
   size_t size = radio.getPacketLength();
-  int16_t st = radio.readData(buf, size);   // o rádio continua em RX contínuo
- //st é o código de status (RADIOLIB_ERR_NONE = sucesso)
-  if (st != RADIOLIB_ERR_NONE || size != sizeof(BeaconPacket)) return;  // CRC/cabeçalho ruim ou outro formato
+  int16_t st = radio.readData(buf, size);
+  if (st != RADIOLIB_ERR_NONE || size != sizeof(BeaconPacket)) return;
   BeaconPacket p;
-  memcpy(&p, buf, sizeof(p)); // copia os bytes pra struct do beacon
+  memcpy(&p, buf, sizeof(p));
   if (p.magic != PKT_MAGIC || p.version != PKT_VERSION) return;
 
-  float rssi  = radio.getRSSI(); // intensidade do sinal
-  float snr   = radio.getSNR(); // relacao sinal/ruido
-  long  ferr  = lroundf(radio.getFrequencyError()); // erro de frequencia
-  // Abaixo do piso de ruído (SNR<0) o RSSI do pacote superestima o sinal:
-  // potência do sinal ≈ RSSI + SNR  (datasheet SX1276, sec. 5.5.5)
+  float rssi    = radio.getRSSI();
+  float snr     = radio.getSNR();
   float rssiEff = snr < 0 ? rssi + snr : rssi;
-  // Normaliza para a potência de referência usada na calibração
   float rssiNorm = rssiEff - (p.txPowerDbm - REF_TX_POWER_DBM);
-
-  digitalWrite(LED_PIN, HIGH); // acende led quando recebe pacote :)
 
   BeaconTrack& t = *getTrack(p.beaconId);
   if (t.received > 0 && p.seq > t.lastSeq + 1) t.lost += p.seq - t.lastSeq - 1;
@@ -295,87 +250,66 @@ static void handlePacket() {
   t.lastSeenMs = millis();
   t.lastFlags = p.flags;
   t.batteryMv = p.batteryMv;
-  if (p.flags & FLAG_GPS_VALID) { // grava a posicao real
+  if (p.flags & FLAG_GPS_VALID) {
     t.hasTruth = true;
     t.truthLat = p.latE7 / 1e7;
     t.truthLon = p.lonE7 / 1e7;
   }
 
-  bool good = gpsGood();
-  int anchorIdx = -1;
-  double myLat = gps.location.lat(), myLon = gps.location.lng();
-  if (good) {
-    if (!originSet) { // define origem
-      originSet = true; lat0 = myLat; lon0 = myLon; cosLat0 = cos(lat0 * DEG_TO_RAD);
-    }
-    double x, y;
-    toLocal(myLat, myLon, x, y);
-    anchorIdx = addToAnchor(t, x, y, rssiNorm); // amostra vira ancora
+  if (!capturing) {
+    //Serial.printf("# [%08X] rssi=%.0f snr=%.1f (aperte o botao no ponto %d p/ coletar)\n",
+    //              p.beaconId, rssi, snr, curPoint + 1);
+    return;
   }
 
-  //Serial.printf("PKT,%lu,%08X,%lu,%.0f,%.2f,%.1f,%ld,%.7f,%.7f,%.1f,%lu,%d,%u,%.7f,%.7f\n",
-  //              (unsigned long)millis(), p.beaconId, (unsigned long)p.seq, rssi, snr, rssiEff,
-  //              ferr, myLat, myLon, gps.hdop.hdop(), (unsigned long)gps.satellites.value(),
-  //              anchorIdx, p.flags, p.latE7 / 1e7, p.lonE7 / 1e7);
-
-  //if (!good) Serial.println("# GPS do socorrista sem qualidade - amostra nao usada como ancora");
-  if (!good) {
-    Serial.println("GPS ruim\n");
-    Serial.println("amostra sem uso\n");
-  }
-
-  // ---- calibração ----
-  if (calRemaining > 0) {
-    addCalPoint(rssiNorm, calDistance);
-    if (--calRemaining == 0)
-      Serial.printf("# calibracao: coleta a %.1f m concluida (%d pontos no total)\n",
-                    calDistance, (int)cal.n);
-  }
-  if (autoCal && good && (p.flags & FLAG_GPS_VALID)) {
-    addCalPoint(rssiNorm, TinyGPSPlus::distanceBetween(myLat, myLon, t.truthLat, t.truthLon));
-  }
-
-  if (good) runEstimate(t);
+  digitalWrite(LED_PIN, HIGH);
+  addToPoint(t, curPoint, rssiNorm);
+  //Serial.printf("# ponto %d  [%08X]  amostra %d/%d  rssi=%.0f\n", curPoint + 1, p.beaconId,
+  //              CAPTURE_SAMPLES - capRemaining + 1, CAPTURE_SAMPLES, rssiNorm);
+  if (--capRemaining <= 0) finishCapture(true);
   digitalWrite(LED_PIN, LOW);
 }
 
+// ---------------------------------------------------------------------
+static void handleButton() {
+  static bool lastRaw = HIGH, stable = HIGH;
+  static uint32_t changedMs = 0;
+  bool raw = digitalRead(BUTTON_PIN);
+  if (raw != lastRaw) { lastRaw = raw; changedMs = millis(); }
+  if (millis() - changedMs > DEBOUNCE_MS && raw != stable) {
+    stable = raw;
+    if (stable == LOW) startCapture();    // borda de descida = botão apertado
+  }
+}
+
 static void printStatus() {
-  //Serial.printf("# SOCORRISTA  f=%.1f MHz SF%d BW%ld kHz\n", LORA_FREQ_HZ / 1e6, LORA_SF,
-  //              LORA_BW_HZ / 1000);
-  Serial.printf("SOCORRISTA %.1f MHz\n", LORA_FREQ_HZ / 1e6);
-  //Serial.printf("# modelo: A=%.1f dBm  n=%.2f  raio_ancora=%.1f m  estimarA=%d  autocal=%d\n",
-  //              model.A, model.n, anchorRadius, solverOpt.estimateA, autoCal);
-  
+  //Serial.printf("SOCORRISTA %.1f MHz | A=%.1f n=%.2f | proximo ponto: %d/%d\n",
+  //              LORA_FREQ_HZ / 1e6, model.A, model.n, curPoint + 1, N_PONTOS);
   for (auto& t : tracks) {
     if (!t.used) continue;
-    float per = t.received + t.lost > 0 ? 100.0f * t.lost / (t.received + t.lost) : 0;
-    //Serial.printf("# beacon %08X: rx=%lu perdidos=%.0f%% ancoras=%d bat=%umV visto ha %lus%s\n",
-    //              t.id, (unsigned long)t.received, per, t.nAnchors, t.batteryMv,
+    //Serial.printf("# beacon %08X: rx=%lu pontos=%d bat=%umV visto ha %lus%s\n",
+    //              t.id, (unsigned long)t.received, countAnchors(t), t.batteryMv,
     //              (unsigned long)((millis() - t.lastSeenMs) / 1000),
     //              (t.lastFlags & FLAG_SOS) ? " SOS" : "");
   }
 }
 
+// ---------------------------------------------------------------------
 void setup() {
-
-  //segunda serial
   Serial.begin(115200);
-  Serial2.begin(PICO_BAUD, SERIAL_8N1, PICO_RX_PIN, PICO_TX_PIN);  // segunda serial -> Pico
+  Serial2.begin(PICO_BAUD, SERIAL_8N1, PICO_RX_PIN, PICO_TX_PIN);
   pinMode(LED_PIN, OUTPUT);
-  delay(200);
-
-  Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, BUTTON_PIN >= 34 ? INPUT : INPUT_PULLUP);
   delay(200);
 
   prefs.begin("socorrista", false);
   model.A = prefs.getFloat("A", MODEL_A_DBM);
   model.n = prefs.getFloat("n", MODEL_N);
-  anchorRadius = prefs.getFloat("raio", ANCHOR_RADIUS_M);
   solverOpt.estimateA = prefs.getBool("estA", true);
 
-  Serial1.setRxBufferSize(2048);   // o solver pode levar ~centenas de ms
-  Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  // Plano local com origem no ponto 1; converte todos os pontos para metros
+  lat0 = PONTOS[0].lat; lon0 = PONTOS[0].lon; cosLat0 = cos(lat0 * DEG_TO_RAD);
+  for (int i = 0; i < N_PONTOS; i++) toLocal(PONTOS[i].lat, PONTOS[i].lon, px[i], py[i]);
 
   int16_t st = loraInit();
   if (st == RADIOLIB_ERR_NONE) {
@@ -388,18 +322,22 @@ void setup() {
   }
 
   printStatus();
-  Serial.println("PKT,ms,id,seq,rssi,snr,rssi_eff,freq_err,lat,lon,hdop,sats,ancora,flags,b_lat,b_lon");
-  Serial.println("EST,ms,id,lat,lon,raio1s_m,n_ancoras,A,rms_db,geom,dist_m,rumo_deg,erro_real_m"); //estimado
-
-
+  Serial.printf("va ao ponto 1\n");
 }
 
 void loop() {
-  //while (Serial1.available()) gps.encode(Serial1.read());
+  handleButton();
 
   if (rxFlag) {
     rxFlag = false;
     handlePacket();
+  }
+
+  if (capturing && millis() - capStartMs > CAPTURE_TIMEOUT_MS) {
+    // aceita se pelo menos 1 amostra chegou
+    bool any = false;
+    for (auto& t : tracks) if (t.used && t.anchors[curPoint].count > 0) any = true;
+    finishCapture(any);
   }
 
   static uint32_t lastStatus = 0;
