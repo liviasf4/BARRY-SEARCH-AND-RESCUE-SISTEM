@@ -395,7 +395,7 @@ void setup() {
 }
 
 void loop() {
-  //while (Serial1.available()) gps.encode(Serial1.read());
+  while (Serial1.available()) gps.encode(Serial1.read());
 
   if (rxFlag) {
     rxFlag = false;
