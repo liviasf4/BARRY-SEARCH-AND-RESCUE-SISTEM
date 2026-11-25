@@ -205,7 +205,7 @@ static void IRAM_ATTR onRxDone() { rxFlag = true; }
 static void finishCapture(bool ok) {
   capturing = false;
   if (!ok) {
-    //Serial.printf("ponto %d: nenhum pacote recebido (timeout). Aperte o botao de novo.\n", curPoint + 1);
+    Serial.printf("ponto %d: nenhum pacote recebido (timeout). Aperte o botao de novo.\n", curPoint + 1);
     return;
   }
   Serial.printf("p%d coletado\n", curPoint + 1);
@@ -213,7 +213,7 @@ static void finishCapture(bool ok) {
   for (auto& t : tracks) if (t.used && t.anchors[curPoint].count > 0) runEstimate(t);
   if (curPoint < N_PONTOS - 1) {
     curPoint++;
-    Serial.printf("va ate ponto %d\n", curPoint + 1);
+    //Serial.printf("va ate ponto %d\n", curPoint + 1);
   } else {
     //Serial.println("# todos os pontos coletados (use 'ponto <n>' para recoletar)");
   }
@@ -226,7 +226,7 @@ static void startCapture() {
   capturing    = true;
   capRemaining = CAPTURE_SAMPLES;
   capStartMs   = millis();
-  //Serial.printf("# coletando no ponto %d (%.6f, %.6f)... fique parado\n", curPoint + 1, PONTOS[curPoint].lat, PONTOS[curPoint].lon);
+  Serial.printf("coletando p%d\n", curPoint + 1);
 }
 
 static void handlePacket() {
@@ -257,15 +257,14 @@ static void handlePacket() {
   }
 
   if (!capturing) {
-    //Serial.printf("# [%08X] rssi=%.0f snr=%.1f (aperte o botao no ponto %d p/ coletar)\n",
-    //              p.beaconId, rssi, snr, curPoint + 1);
+    Serial.printf("aperte o botao\n");
     return;
   }
 
   digitalWrite(LED_PIN, HIGH);
   addToPoint(t, curPoint, rssiNorm);
-  //Serial.printf("# ponto %d  [%08X]  amostra %d/%d  rssi=%.0f\n", curPoint + 1, p.beaconId,
-  //              CAPTURE_SAMPLES - capRemaining + 1, CAPTURE_SAMPLES, rssiNorm);
+  Serial.printf("p%d %d/ de %d\n", curPoint + 1,
+                CAPTURE_SAMPLES - capRemaining + 1, CAPTURE_SAMPLES);
   if (--capRemaining <= 0) finishCapture(true);
   digitalWrite(LED_PIN, LOW);
 }
