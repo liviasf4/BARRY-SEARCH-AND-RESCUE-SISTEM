@@ -283,8 +283,7 @@ static void handleButton() {
 }
 
 static void printStatus() {
-  //Serial.printf("SOCORRISTA %.1f MHz | A=%.1f n=%.2f | proximo ponto: %d/%d\n",
-  //              LORA_FREQ_HZ / 1e6, model.A, model.n, curPoint + 1, N_PONTOS);
+  Serial.printf("SOCORRISTA %.1f MHz\n", LORA_FREQ_HZ / 1e6);
   for (auto& t : tracks) {
     if (!t.used) continue;
     //Serial.printf("# beacon %08X: rx=%lu pontos=%d bat=%umV visto ha %lus%s\n",
@@ -343,6 +342,6 @@ void loop() {
   static uint32_t lastStatus = 0;
   if (millis() - lastStatus > STATUS_PERIOD_MS) {
     lastStatus = millis();
-    printStatus();
+    //printStatus();
   }
 }
