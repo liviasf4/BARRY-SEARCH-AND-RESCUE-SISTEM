@@ -37,7 +37,7 @@
 #define MODEL_A_DBM -45.0
 #endif
 #ifndef MODEL_N
-#define MODEL_N 2.7
+#define MODEL_N 2.5
 #endif
 
 // ---- PONTOS FIXOS CONHECIDOS ----
